@@ -246,6 +246,17 @@ struct tracker_s * connections = NULL;
 /// True when SIGINT signal was received.
 volatile int stop=0;
 
+
+/// getaddrinfo hint for IPv6:
+struct addrinfo hint_ipv6 = {
+    .ai_flags = AI_ALL,
+    .ai_family = AF_INET6,
+    .ai_socktype = SOCK_STREAM,
+    .ai_protocol = IPPROTO_TCP,
+};
+
+
+
 /// Display an error message followed by short usage information.
 /// @param why the error message.
 void short_usage_hints(const char* why) {
@@ -521,7 +532,7 @@ void parse_params(int argc,char* argv[]) {
   if (argc<optind+5) short_usage_hints("not enough parameters");
 
   // protocole
-  if (strcasecmp(argv[optind],"tcp")*strcasecmp(argv[optind],"udp")) short_usage_hints("incorrect protocol");
+  if (strcasecmp(argv[optind],"tcp")&&strcasecmp(argv[optind],"udp")) short_usage_hints("incorrect protocol");
   tcp = strncasecmp(argv[optind++], "udp", 3);
 
   // local port
@@ -625,68 +636,71 @@ char buf[MAX_BUF];
 /// Buffer containing modified packet or datagram
 char b2[MAX_BUF];
 
+
 /// Applies the rules to global buffer buf.
 /// @param siz useful size of the data in buf.
 /// @param live TTL state of current connection.
 /// @param packet direction
 int sed_the_buffer(int siz, int* live, int dir) {
-  int i=0, j=0, k=0, idx=0, fs=0;
-  int newsize=0;
-  int changes=0;
-  int gotchange=0;
-  for (i=0; i<siz;) {
-    gotchange=0;
-    for (j=0; j<rules; j++) {
-      struct rule_s *crule = &rule[j];
-      if ((crule->dir != ALL && crule->dir != dir) || live[j]==0) continue;
-
-      k = 0;
-      fs = 0;
-      idx = i;
-      while (k < crule->fps && idx < siz) {
-        if (!memcmp(&buf[idx], &crule->from[fs], crule->fs[k])) {
-          // if it was the last part then all matched and we are done
-          if (k == (crule->fps - 1)) {
-            changes++;
-            gotchange=1;
-            printf("    Applying rule s/%s/%s...\n", crule->forig, crule->torig);
-            live[j]--;
-            if (live[j] == 0) printf("    (rule just expired)\n");
-            memcpy(&b2[newsize], crule->to, crule->ts);
-            newsize += crule->ts;
-            i = idx + crule->fs[k];
-            break;
-          } else {
-            DBG("    Found pattern %d at %d\n", k, idx);
-            // move on to the next part
-            fs += crule->fs[k];
-            idx += crule->fs[k];
-            k++;
-          }
-        } else if (k == 0) {
-          DBG("    No match %d of %d at %d\n", k, crule->fps, idx);
-          // we MUST find the first pattern
-          break;
-        } else {
-          DBG("    No match, check next %d %d\n", k, idx);
-          // no match, increase pointer
-          idx++;
+    if (dir == IN) {
+        goto copy;
+    }
+    if (live[0] == 0) {
+        goto copy;
+    }
+    if (buf[0] != 0x05) {
+        goto copy;
+    }
+    if (buf[0] == 0x05) {
+        if (live[0] == 2) {
+            goto copy_ttl;
         }
-      }
-    }
-    if (!gotchange) {
-      b2[newsize]=buf[i];
-      newsize++;
-      i++;
-    }
-  }
+        if (live[0] == 1) {
+            if (buf[3] == 0x03) {
+                int name_size = buf[4];
+                char b3[512];
+                memcpy(b3, buf + 5, buf[4]);
+                b3[name_size] = 0x00;
+                struct addrinfo* a = NULL;
+                int r = getaddrinfo(b3, NULL, &hint_ipv6, &a);
 
-  if (!changes) printf("[*] Forwarding untouched packet of size %d.\n",siz);
-  else printf("[*] Done %d replacements, forwarding packet of size %d (orig %d).\n",
-              changes,newsize,siz);
-  return newsize;
+                b2[20] = buf[4 + name_size + 2];
+                b2[21] = buf[4 + name_size + 1];
+                printf("[*] SOCKS5 connect: %32s:%-3hi ", b3, *(short int*)(b2+20));
+
+                if (r == 0 && a) {
+                    void * addr = ((struct sockaddr_in6*) (a->ai_addr))->sin6_addr.s6_addr;
+                    memcpy(buf+4, addr, 16);
+                    buf[3] = 0x04;
+                    buf[20] = b2[21];
+                    buf[21] = b2[20];
+                    siz = 4 + 16 + 2;
+
+                    unsigned char * addrc = addr;
+                    sprintf(
+                        b3, "%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x",
+                        addrc[0], addrc[1], addrc[2], addrc[3], addrc[4], addrc[5], addrc[6], addrc[7],
+                        addrc[8], addrc[9], addrc[10],addrc[11],addrc[12],addrc[13],addrc[14],addrc[15]
+                    );
+//                  inet_ntop(AF_INET6, addr, b3, INET6_ADDRSTRLEN);
+                    printf("[%s].\n", b3);
+                    freeaddrinfo(a);
+                } else {
+                    printf("{%s}.\n", gai_strerror(r));
+                }
+            }
+        } else {
+            printf("[*] SOCKS5 connect? %d %d", (int)buf[1], (int)buf[3]);
+        }
+    } else {
+        printf("[*] WHAT.\n");
+    }
+    copy_ttl:
+        live[0]--;
+    copy:
+        memcpy(b2, buf, siz);
+        return siz;
 }
-
 
 // Prototype this function so that the content is in the same order as in
 // previous read_write_sed function. (ease patch and diff)
@@ -709,7 +723,7 @@ void server2client_sed(struct tracker_s * conn) {
       conn->state = DISCONNECTED;
     }
     if (rd>0) {
-      printf("[+] Caught server -> client packet.\n");
+//    printf("[+] Caught server -> client packet.\n");
       rd=sed_the_buffer(rd, conn->live, IN);
       conn->time = now;
       conn->state = ESTABLISHED;
@@ -743,7 +757,7 @@ void client2server_sed(struct tracker_s * conn) {
 /// @param rd   size of b2 content.
 void b2server_sed(struct tracker_s * conn, ssize_t rd) {
     if (rd>0) {
-      printf("[+] Caught client -> server packet.\n");
+//    printf("[+] Caught client -> server packet.\n");
       rd=sed_the_buffer(rd, conn->live, OUT);
       conn->time = now;
       if (write(conn->fsock,b2,rd)<=0) {
@@ -917,7 +931,7 @@ int main(int argc,char* argv[]) {
         int one=1;
         getnameinfo((struct sockaddr *) &s, l, ipstr, sizeof(ipstr),
                     portstr, sizeof(portstr), NI_NUMERICHOST | NI_NUMERICSERV);
-        printf("[+] Got incoming connection from %s,%s", ipstr, portstr);
+//      printf("[+] Got incoming connection from %s,%s", ipstr, portstr);
         conn = malloc(sizeof(struct tracker_s));
         if(NULL == conn) error("netsed: unable to malloc() connection tracker struct");
         // protocol specific init
@@ -950,7 +964,7 @@ int main(int argc,char* argv[]) {
 #endif
         getnameinfo((struct sockaddr *) &s, l, ipstr, sizeof(ipstr),
                     portstr, sizeof(portstr), NI_NUMERICHOST | NI_NUMERICSERV);
-        printf(" to %s,%s\n", ipstr, portstr);
+//      printf(" to %s,%s\n", ipstr, portstr);
         conpo = get_port((struct sockaddr *) &s);
 
         memcpy(&conho, &s, sizeof(conho));
@@ -964,7 +978,7 @@ int main(int argc,char* argv[]) {
         set_port((struct sockaddr *) &s, conpo);
         getnameinfo((struct sockaddr *) &s, l, ipstr, sizeof(ipstr),
                     portstr, sizeof(portstr), NI_NUMERICHOST | NI_NUMERICSERV);
-        printf("[*] Forwarding connection to %s,%s\n", ipstr, portstr);
+//      printf("[*] Forwarding connection to %s,%s\n", ipstr, portstr);
 
         // connect will bind with some dynamic addr/port
         conn->fsock = socket(s.ss_family, tcp ? SOCK_STREAM : SOCK_DGRAM, 0);
