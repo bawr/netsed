@@ -592,7 +592,7 @@ void bind_and_listen(int af, int tcp, const char *portstr) {
   hints.ai_flags = AI_PASSIVE;
   hints.ai_socktype = tcp ? SOCK_STREAM : SOCK_DGRAM;
 
-  if ((ret = getaddrinfo(NULL, portstr, &hints, &reslist))) {
+  if ((ret = getaddrinfo("127.0.0.2", portstr, &hints, &reslist))) {
     ERR("getaddrinfo(): %s\n", gai_strerror(ret));
     error("Impossible to resolve listening port.");
   }
